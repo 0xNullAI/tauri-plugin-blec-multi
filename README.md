@@ -199,38 +199,56 @@ disconnects any other device that is already connected.
 - `cargo check` / `cargo clippy -- -D warnings` / `cargo build` / `cargo test`
   all pass for the desktop target (`aarch64-apple-darwin`).
 - `cargo check` / `cargo clippy -- -D warnings` / `cargo build` all pass for
-  `--target aarch64-linux-android` (this exercises `src/android.rs`, the
-  code path Android actually uses; it does not link, since no NDK build of
-  the full Tauri Android Gradle project was performed — see below).
+  `--target aarch64-linux-android` (exercises `src/android.rs`, the code
+  path Android actually uses).
 - `npx tsc --noEmit` and `npx rollup -c` (the package's real build script)
   both succeed for `guest-js/`.
 - New unit tests (`src/handler.rs::tests`, `src/models.rs::tests`) cover the
   default-address resolution rules and the model helpers; there was no prior
   Rust test suite in this repo to extend.
+- **A full `cargo tauri android build --debug --target aarch64` against
+  `examples/plugin-blec-example` was run end-to-end in this environment**
+  (JDK 17, Android SDK, NDK 26.1.10909125, network access to
+  dl.google.com/maven.google.com/services.gradle.org were all available)
+  and **succeeded**: the modified `tauri-plugin-blec` crate cross-compiled
+  cleanly for `aarch64-linux-android`, the modified/unmodified `android/`
+  Kotlin sources compiled through Gradle 8.9 + AGP 8.5.1 with zero errors
+  (2 pre-existing, unrelated warnings in `Peripheral.kt`), and Gradle
+  produced a real `app-universal-debug.apk` (and a matching `.aab`) at
+  `examples/plugin-blec-example/src-tauri/gen/android/app/build/outputs/`.
+  This proves the whole Rust→JNI→Kotlin plugin compiles and links
+  end-to-end with the multi-device changes, on the real Android toolchain,
+  not just `cargo check`. Two unrelated fixes were needed to get this far
+  and are included in this fork: the example's pinned `tauri`/
+  `tauri-plugin-shell` Cargo.toml versions were loosened (they had drifted
+  behind the npm-resolved `@tauri-apps/api`/`plugin-shell` versions and
+  `cargo tauri` refused to build on the mismatch), and its
+  `beforeDevCommand`/`beforeBuildCommand` were switched from `yarn` to
+  `npm` (no `yarn`/`corepack` was available in this environment).
 
-### What was **not** verified (no real device / full Android toolchain in this environment)
+### What was **not** verified
 
-- No real multi-device BLE hardware test was performed (no BLE adapter/devices
-  available in this sandboxed environment).
-- The Android Kotlin code was **not** compiled through Gradle/the Tauri
-  Android Gradle project (`examples/plugin-blec-example/src-tauri/gen/android`)
-  — that requires `cargo tauri android build`/`dev`, which fetches Android
-  Gradle Plugin / AndroidX dependencies from Google's Maven and was not
-  exercised end-to-end here. Since no Kotlin source in `android/` was
-  changed, this is low-risk, but it has not been proven.
+- No real BLE hardware test was performed — no BLE adapter/peripherals are
+  available in this sandboxed environment, so while the APK builds and
+  installs-in-principle, nobody has actually run it and connected to two
+  real devices at once to observe the concurrent-connection behavior live.
+- No emulator/device was available to actually install and run the built
+  APK (no `adb devices` target).
 - No iOS testing was performed (this plugin uses btleplug directly on iOS,
   same as upstream; nothing iOS-specific changed here).
 
 ### Next steps (for a future session)
 
-1. Attempt a real `cargo tauri android build` (or `dev`) against
-   `examples/plugin-blec-example` to get an actual APK and, ideally, run it
-   against two or more real BLE peripherals to confirm concurrent
-   connections behave as designed end-to-end.
+1. Install `examples/plugin-blec-example/.../app-universal-debug.apk` on a
+   real Android device or emulator and connect to two or more real BLE
+   peripherals concurrently to confirm the behavior end-to-end (this is the
+   one thing that could not be checked in this sandboxed environment).
 2. Wire this fork into DG-Kit's `packages/transport-tauri-blec` (out of
    scope for this fork itself — that package currently assumes the
    single-device upstream API and will need its call sites updated to pass
    `address` explicitly wherever more than one DG device may be connected).
+   The relevant DG-Kit files are `packages/transport-tauri-blec/src/plugin-blec.ts`,
+   `client.ts`, `characteristic.ts`, and `gatt-shim.ts`.
 3. Consider publishing this fork's Rust crate and npm package under new
    names (e.g. `tauri-plugin-blec-multi` / `@0xnullai/plugin-blec-multi`) if
    it is to be consumed the same way upstream is (`cargo add` / `npm add`)
