@@ -19,6 +19,9 @@ pub enum Error {
     #[error("Device is already connected.")]
     AlreadyConnected,
 
+    #[error("Multiple devices are connected ({0:?}); an address must be specified to disambiguate which one this operation applies to")]
+    AmbiguousDevice(Vec<String>),
+
     #[error("Handler not initialized")]
     HandlerNotInitialized,
 

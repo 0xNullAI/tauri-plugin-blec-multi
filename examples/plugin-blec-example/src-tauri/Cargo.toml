@@ -15,11 +15,16 @@ name = "plugin_blec_example_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.0.0", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = [] }
-tauri-plugin-shell = "2.2.1"
+# NOTE: loosened from the upstream example's exact "2.0.0"/"2.2.1" pins,
+# which no longer match the npm-resolved @tauri-apps/api / plugin-shell
+# versions (npm's own ranges float upward with time) and made `cargo tauri
+# android build` refuse to run with a "mismatched Tauri packages" error.
+# This is example-app scaffolding drift, unrelated to the plugin itself.
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = { version = "0.1.40", features = ["log"] }

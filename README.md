@@ -1,14 +1,37 @@
-# Tauri Plugin blec
+# Tauri Plugin blec (multi-device fork)
 
 A BLE-Client plugin based on [btlelug](https://github.com/deviceplug/btleplug).
 
 The main difference to using btleplug directly is that this uses the tauri plugin system for android.
 All other platforms use the btleplug implementation.
 
+> **This is a fork of [MnlPhlp/tauri-plugin-blec](https://github.com/MnlPhlp/tauri-plugin-blec)**,
+> maintained at [0xNullAI/tauri-plugin-blec-multi](https://github.com/0xNullAI/tauri-plugin-blec-multi).
+> All credit for the original plugin design (and the vast majority of the
+> code) goes to [Manuel Philipp](https://github.com/MnlPhlp). This fork is
+> distributed under the same MIT license as the upstream project (see
+> `LICENSE_MIT`/`LICENSE_APACHE`); only the section below and the "Multi-device
+> support" changes are new to this fork.
+>
+> **Why this fork exists:** the upstream plugin is architected around exactly
+> one globally-active BLE connection — `connect()`/`disconnect()`/`send()`/
+> `read()`/`subscribe()` all implicitly operate on "the currently connected
+> device", with no per-device identifier anywhere in the public API. This is
+> not an Android or btleplug limitation (Android natively supports several
+> concurrent GATT connections, and btleplug's `Peripheral` objects are
+> already per-device); it's purely this plugin's own design choice at the
+> `Handler` layer. Apps that need to talk to more than one BLE peripheral at
+> a time (e.g. several independent BLE-controlled devices) would have a
+> second `connect()` call silently steal/replace the first device's
+> connection. This fork replaces that single global connection slot with a
+> `HashMap<address, Connection>` so multiple devices can be connected and
+> operated on independently and concurrently. See "Multi-device support"
+> below for details and current status.
+
 ## Docs
 
-- [Rust docs](https://docs.rs/crate/tauri-plugin-blec/latest)
-- [JavaScript docs](https://mnlphlp.github.io/tauri-plugin-blec/)
+- [Rust docs (upstream)](https://docs.rs/crate/tauri-plugin-blec/latest) — this fork has not yet been published to docs.rs; read `src/handler.rs` doc comments directly for the moment.
+- [JavaScript docs (upstream)](https://mnlphlp.github.io/tauri-plugin-blec/)
 
 ## Installation
 
@@ -115,7 +138,100 @@ const CHARACTERISTIC_UUID: Uuid = uuid!("51FF12BB-3ED8-46E5-B4F9-D64E2FEC021B");
 const DATA: [u8; 500] = [0; 500];
 let handler = tauri_plugin_blec::get_handler().unwrap();
 handler
-    .send_data(CHARACTERISTIC_UUID, &DATA, WriteType::WithResponse)
+    .send_data(CHARACTERISTIC_UUID, None, &DATA, WriteType::WithResponse)
     .await
     .unwrap();
 ```
+
+## Multi-device support
+
+This fork can maintain **multiple concurrent BLE connections** at once, each
+tracked independently by address. Connecting to a new device never
+disconnects any other device that is already connected.
+
+### What changed vs. upstream
+
+- **Rust core (`src/handler.rs`)**: the old `connected_dev: Mutex<Option<Peripheral>>`
+  single-connection slot was replaced with `connections: Arc<Mutex<HashMap<String, Connection>>>`,
+  where each `Connection` owns its own characteristics cache, notification
+  listeners, disconnect callback, and a per-device lock that serializes GATT
+  operations *for that device only* — so operations against different
+  devices run fully in parallel instead of being globally serialized.
+- **New address-aware methods** were added alongside the originals:
+  `disconnect_device(address)`, `send_data_to(address, ...)`,
+  `recv_data_from(address, ...)`, `subscribe_to(address, ...)`,
+  `unsubscribe_from(address, ...)`, `mtu_of(address)`,
+  `connected_device_at(address)`, `connected_addresses()`,
+  `connected_devices()`, `is_connected_to(address)`.
+- **Backward compatibility**: the original address-less methods
+  (`disconnect()`, `send_data()`, `recv_data()`, `subscribe()`,
+  `unsubscribe()`, `mtu()`, `connected_device()`, `is_connected()`) still
+  exist with their original signatures, as thin wrappers that resolve "the"
+  connected device automatically. This only works unambiguously when at most
+  one device is connected: with zero connections they return
+  `Error::NoDeviceConnected` as before; with **more than one** concurrent
+  connection they now return `Error::AmbiguousDevice(addresses)` instead of
+  silently guessing (or, as upstream did, silently operating on whichever
+  device happened to overwrite the single slot last). Existing single-device
+  call sites therefore keep working unmodified; call sites that may have
+  more than one device connected must switch to the address-aware methods.
+- **Tauri commands / JS bindings (`src/commands.rs`, `guest-js/index.ts`)**:
+  `disconnect`, `send`, `send_string`, `recv`, `recv_string`, `subscribe`,
+  `subscribe_string`, `unsubscribe`, and `mtu` all gained an **optional**
+  trailing `address` parameter (same backward-compatible resolution rules as
+  above). New commands: `connected_devices` (list all connected devices) and
+  `device_connection_state` (per-device connection status stream, exposed in
+  JS as `connectedDevices()` and `getDeviceConnectionUpdates()`).
+- **Android (`android/`) and the btleplug/Android bridge (`src/android.rs`)**:
+  **no changes were needed.** The Kotlin plugin (`BleClientPlugin.kt`)
+  already tracked `connected_devices: MutableMap<String, Peripheral>` keyed
+  by address, and each Kotlin `Peripheral` already owns its own
+  `BluetoothGatt` connection — i.e. the native Android layer already
+  supported concurrent connections; the single-connection limitation lived
+  entirely in the Rust `Handler`. `src/android.rs` (the btleplug shim that
+  talks to the Kotlin plugin) already passed `address` on every plugin
+  invocation for the same reason. Two pre-existing, unrelated clippy lints
+  in `src/android.rs` were fixed in passing so `cargo clippy --target
+  aarch64-linux-android -- -D warnings` is clean.
+
+### What was verified
+
+- `cargo check` / `cargo clippy -- -D warnings` / `cargo build` / `cargo test`
+  all pass for the desktop target (`aarch64-apple-darwin`).
+- `cargo check` / `cargo clippy -- -D warnings` / `cargo build` all pass for
+  `--target aarch64-linux-android` (this exercises `src/android.rs`, the
+  code path Android actually uses; it does not link, since no NDK build of
+  the full Tauri Android Gradle project was performed — see below).
+- `npx tsc --noEmit` and `npx rollup -c` (the package's real build script)
+  both succeed for `guest-js/`.
+- New unit tests (`src/handler.rs::tests`, `src/models.rs::tests`) cover the
+  default-address resolution rules and the model helpers; there was no prior
+  Rust test suite in this repo to extend.
+
+### What was **not** verified (no real device / full Android toolchain in this environment)
+
+- No real multi-device BLE hardware test was performed (no BLE adapter/devices
+  available in this sandboxed environment).
+- The Android Kotlin code was **not** compiled through Gradle/the Tauri
+  Android Gradle project (`examples/plugin-blec-example/src-tauri/gen/android`)
+  — that requires `cargo tauri android build`/`dev`, which fetches Android
+  Gradle Plugin / AndroidX dependencies from Google's Maven and was not
+  exercised end-to-end here. Since no Kotlin source in `android/` was
+  changed, this is low-risk, but it has not been proven.
+- No iOS testing was performed (this plugin uses btleplug directly on iOS,
+  same as upstream; nothing iOS-specific changed here).
+
+### Next steps (for a future session)
+
+1. Attempt a real `cargo tauri android build` (or `dev`) against
+   `examples/plugin-blec-example` to get an actual APK and, ideally, run it
+   against two or more real BLE peripherals to confirm concurrent
+   connections behave as designed end-to-end.
+2. Wire this fork into DG-Kit's `packages/transport-tauri-blec` (out of
+   scope for this fork itself — that package currently assumes the
+   single-device upstream API and will need its call sites updated to pass
+   `address` explicitly wherever more than one DG device may be connected).
+3. Consider publishing this fork's Rust crate and npm package under new
+   names (e.g. `tauri-plugin-blec-multi` / `@0xnullai/plugin-blec-multi`) if
+   it is to be consumed the same way upstream is (`cargo add` / `npm add`)
+   rather than via a git/path dependency.

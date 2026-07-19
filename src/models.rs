@@ -216,3 +216,64 @@ pub enum AdapterState {
     Off,
     On,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btleplug::api::BDAddr;
+
+    #[test]
+    fn fmt_addr_formats_colon_separated_uppercase_hex() {
+        let addr = BDAddr::from([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0xff]);
+        assert_eq!(fmt_addr(addr), "00:1A:2B:3C:4D:FF");
+    }
+
+    #[test]
+    fn write_type_maps_to_btleplug_equivalent() {
+        assert!(matches!(
+            btleplug::api::WriteType::from(WriteType::WithResponse),
+            btleplug::api::WriteType::WithResponse
+        ));
+        assert!(matches!(
+            btleplug::api::WriteType::from(WriteType::WithoutResponse),
+            btleplug::api::WriteType::WithoutResponse
+        ));
+    }
+
+    #[test]
+    fn char_props_round_trip_through_bitflags() {
+        let flags = get_flags(
+            btleplug::api::CharPropFlags::READ | btleplug::api::CharPropFlags::NOTIFY,
+        );
+        assert!(flags.contains(CharProps::Read));
+        assert!(flags.contains(CharProps::Notify));
+        assert!(!flags.contains(CharProps::Write));
+    }
+
+    #[test]
+    fn ble_device_ordering_and_equality_is_by_address_only() {
+        let mut a = BleDevice {
+            address: "AA:AA:AA:AA:AA:AA".to_string(),
+            name: "A".to_string(),
+            is_connected: false,
+            is_bonded: false,
+            manufacturer_data: HashMap::new(),
+            service_data: HashMap::new(),
+            services: vec![],
+            rssi: None,
+            tx_power_level: None,
+        };
+        let mut b = a.clone();
+        b.address = "BB:BB:BB:BB:BB:BB".to_string();
+        b.name = "different name, irrelevant to equality/order".to_string();
+
+        assert!(a < b);
+        assert_ne!(a, b);
+
+        // Same address, different everything else => still equal.
+        a.name = "renamed".to_string();
+        let mut c = a.clone();
+        c.address = a.address.clone();
+        assert_eq!(a, c);
+    }
+}

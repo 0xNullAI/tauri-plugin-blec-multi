@@ -157,7 +157,7 @@ impl btleplug::api::Central for Adapter {
         DEVICES
             .read()
             .await
-            .get(&id)
+            .get(id)
             .cloned()
             .ok_or(btleplug::Error::DeviceNotFound)
     }
@@ -209,9 +209,9 @@ where
     D: serde::Deserializer<'a>,
 {
     let s = String::deserialize(deserializer)?;
-    Ok(base64::engine::general_purpose::STANDARD
+    base64::engine::general_purpose::STANDARD
         .decode(s)
-        .map_err(serde::de::Error::custom)?)
+        .map_err(serde::de::Error::custom)
 }
 
 fn deserialize_base64_map<'a, D, K>(
