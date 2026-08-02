@@ -35,6 +35,31 @@ type Result<T> = std::result::Result<T, btleplug::Error>;
 static HANDLE: OnceCell<PluginHandle<Wry>> = OnceCell::new();
 pub static REQUESTED_MTU: AtomicU16 = AtomicU16::new(517);
 
+/// Buffer sizes for the channels feeding the adapter/peripheral streams.
+///
+/// The producing side is an android binder thread that must never block (it
+/// drives every GATT callback), so both channels are written with `try_send`
+/// and need enough slack to absorb a slow consumer. Adapter events are rare;
+/// characteristic notifications can arrive at tens of packets per second.
+const EVENT_BUFFER: usize = 32;
+const NOTIFY_BUFFER: usize = 128;
+
+/// Report a message that could not be handed to its stream.
+///
+/// A closed channel means the consuming task is gone (device disconnected, or
+/// the listener task was aborted on reconnect) and late callbacks are expected,
+/// so it is logged quietly. A full channel means data is actually being lost.
+fn log_dropped<T>(kind: &str, err: &tokio::sync::mpsc::error::TrySendError<T>) {
+    match err {
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+            debug!("dropping {kind}: receiver is gone")
+        }
+        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+            tracing::warn!("dropping {kind}: consumer is not keeping up")
+        }
+    }
+}
+
 fn get_handle() -> &'static PluginHandle<Wry> {
     HANDLE.get().expect("plugin handle not initialized")
 }
@@ -102,15 +127,24 @@ impl btleplug::api::Central for Adapter {
     }
 
     async fn events(&self) -> Result<Pin<Box<dyn Stream<Item = CentralEvent> + Send>>> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<CentralEvent>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<CentralEvent>(EVENT_BUFFER);
         let stream = ReceiverStream::new(rx);
         let channel: Channel = Channel::new(move |response| {
-            let event = response
-                .deserialize::<CentralEvent>()
-                .expect("failed to deserialize event");
+            // This closure runs on the Android binder thread, called through the
+            // `extern "C"` JNI entry point. A panic here cannot unwind across the
+            // FFI boundary and aborts the whole process, so every error path must
+            // be handled instead of unwrapped.
+            let event = match response.deserialize::<CentralEvent>() {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::error!("failed to deserialize event: {e:?}");
+                    return Err(tauri::Error::from(e));
+                }
+            };
             debug!("sending event: {event:?}");
-            tx.blocking_send(event)
-                .expect("failed to send notification");
+            if let Err(e) = tx.try_send(event) {
+                log_dropped("event", &e);
+            }
             Ok(())
         });
         get_handle()
@@ -554,17 +588,23 @@ impl btleplug::api::Peripheral for Peripheral {
             address: BDAddr,
             channel: Channel<Notification>,
         }
-        let (tx, rx) = tokio::sync::mpsc::channel::<ValueNotification>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ValueNotification>(NOTIFY_BUFFER);
         let stream = ReceiverStream::new(rx);
         let channel: Channel<Notification> = Channel::new(move |response| {
+            // Runs on the android binder thread through the `extern "C"` JNI entry
+            // point — see the comment in `events()`. Never panic, and never block:
+            // this is the same thread that drives every GATT callback, so stalling
+            // it stalls the whole BLE stack.
             match response.deserialize::<Notification>() {
-                Ok(notification) => tx
-                    .blocking_send(ValueNotification {
+                Ok(notification) => {
+                    if let Err(e) = tx.try_send(ValueNotification {
                         uuid: notification.uuid,
                         service_uuid: notification.service_uuid,
                         value: notification.data,
-                    })
-                    .expect("failed to send notification"),
+                    }) {
+                        log_dropped("notification", &e);
+                    }
+                }
                 Err(e) => {
                     tracing::error!("failed to deserialize notification: {:?}", e);
                     return Err(tauri::Error::from(e));

@@ -127,6 +127,10 @@ class Peripheral(
                 this@Peripheral.connected = false
                 val existingGatt = this@Peripheral.gatt ?: gatt
                 this@Peripheral.gatt = null
+                // Drop the notification channel: its rust receiver is torn down
+                // with the connection, and sending into a dead channel is both
+                // pointless and a source of late-callback races.
+                this@Peripheral.notifyChannel = null
                 try {
                     existingGatt?.close()
                 } catch (e: Exception) {
