@@ -94,8 +94,10 @@ class BleDevice(
 
 class BleClient(private val activity: Activity, private val plugin: BleClientPlugin) {
     private var scanner: BluetoothLeScanner? = null
+    private var adapter: BluetoothAdapter? = null
     private var manager: BluetoothManager? = null
     private var scanCb: ScanCallback? = null
+    private var legacyScanCb: BluetoothAdapter.LeScanCallback? = null
     private val advertisedNames = mutableMapOf<String, String>()
     private val advertisedManufacturerData = mutableMapOf<String, SparseArray<ByteArray>>()
 
@@ -125,6 +127,53 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
         return null
     }
 
+    /** Parse AD 0xFF from the raw compatibility-scan record. */
+    private fun parseManufacturerData(record: ByteArray?): SparseArray<ByteArray>? {
+        if (record == null) return null
+        val result = SparseArray<ByteArray>()
+        var offset = 0
+        while (offset < record.size) {
+            val length = record[offset].toInt() and 0xff
+            if (length == 0 || offset + length >= record.size) break
+            val type = record[offset + 1].toInt() and 0xff
+            if (type == 0xff && length >= 3) {
+                val companyId = (record[offset + 2].toInt() and 0xff) or
+                    ((record[offset + 3].toInt() and 0xff) shl 8)
+                result.put(companyId, record.copyOfRange(offset + 4, offset + length + 1))
+            }
+            offset += length + 1
+        }
+        return result.takeIf { it.size() > 0 }
+    }
+
+    /** Parse advertised 16-bit service UUIDs (AD 0x02/0x03). */
+    private fun parseServiceUuids(record: ByteArray?): List<ParcelUuid>? {
+        if (record == null) return null
+        val result = mutableListOf<ParcelUuid>()
+        var offset = 0
+        while (offset < record.size) {
+            val length = record[offset].toInt() and 0xff
+            if (length == 0 || offset + length >= record.size) break
+            val type = record[offset + 1].toInt() and 0xff
+            if (type == 0x02 || type == 0x03) {
+                var cursor = offset + 2
+                val end = offset + length + 1
+                while (cursor + 1 < end) {
+                    val shortUuid = (record[cursor].toInt() and 0xff) or
+                        ((record[cursor + 1].toInt() and 0xff) shl 8)
+                    result.add(
+                        ParcelUuid.fromString(
+                            String.format("0000%04x-0000-1000-8000-00805f9b34fb", shortUuid)
+                        )
+                    )
+                    cursor += 2
+                }
+            }
+            offset += length + 1
+        }
+        return result.takeIf { it.isNotEmpty() }
+    }
+
     private fun markFirstPermissionRequest(perm: String) {
         val sharedPreference: SharedPreferences =
             activity.getSharedPreferences("PREFS_PERMISSION_FIRST_TIME_ASKING", MODE_PRIVATE)
@@ -152,6 +201,7 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
                 ?: throw RuntimeException("No bluetooth manager found")
             val bluetoothAdapter: BluetoothAdapter = manager!!.adapter
                 ?: throw RuntimeException("No bluetooth adapter available")
+            adapter = bluetoothAdapter
             // check if bluetooth is on
             if (!bluetoothAdapter.isEnabled ) {
                 val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
@@ -181,6 +231,46 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
             // requested, which hides the AD 0x09 device name.
             .setLegacy(true)
             .build()
+
+        // The official DG-Lab Android stack keeps a compatibility scanner for
+        // Android 11 and older. Some MIUI Bluetooth stacks deliver the
+        // advertising packet and scan response separately through the modern
+        // API, losing AD 0x09 even though the old callback returns the merged
+        // raw record. Use that platform compatibility path on those releases.
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R) {
+            legacyScanCb = BluetoothAdapter.LeScanCallback { device, rssi, scanRecord ->
+                val currentName = completeLocalName(scanRecord)
+                    ?: device.name?.takeIf { it.isNotBlank() }
+                    ?: device.alias?.takeIf { it.isNotBlank() }
+                if (currentName != null) advertisedNames[device.address] = currentName
+                val name = advertisedNames[device.address] ?: ""
+                val connected = this@BleClient.manager!!.getConnectionState(
+                    device,
+                    BluetoothProfile.GATT_SERVER
+                ) == BluetoothProfile.STATE_CONNECTED
+                val bonded = device.bondState == BluetoothDevice.BOND_BONDED
+                val bleDevice = BleDevice(
+                    device.address,
+                    name,
+                    rssi,
+                    connected,
+                    bonded,
+                    parseManufacturerData(scanRecord),
+                    null,
+                    parseServiceUuids(scanRecord),
+                    null
+                )
+                this@BleClient.plugin.devices[bleDevice.address] =
+                    Peripheral(this@BleClient.activity, device, this@BleClient.plugin)
+                val res = JSObject()
+                res.put("result", bleDevice.toJsObject())
+                args.onDevice!!.send(res)
+            }
+            @Suppress("DEPRECATION")
+            adapter?.startLeScan(legacyScanCb)
+            invoke.resolve()
+            return
+        }
 
         scanCb = object: ScanCallback(){
             private fun sendResult(result: ScanResult){
@@ -245,6 +335,11 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
 
     @SuppressLint("MissingPermission")
     fun stopScan(invoke: Invoke){
+        legacyScanCb?.let { callback ->
+            @Suppress("DEPRECATION")
+            adapter?.stopLeScan(callback)
+            legacyScanCb = null
+        }
         if (scanCb!=null) {
             scanner?.stopScan(scanCb!!)
             scanCb = null
