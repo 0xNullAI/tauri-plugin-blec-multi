@@ -23,7 +23,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.ParcelUuid
 import android.provider.Settings
-import android.util.Log
 import android.util.SparseArray
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
@@ -35,6 +34,7 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import java.util.Base64
+import java.nio.charset.StandardCharsets
 
 class BleDevice(
     val address: String,
@@ -96,6 +96,25 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
     private var scanner: BluetoothLeScanner? = null
     private var manager: BluetoothManager? = null
     private var scanCb: ScanCallback? = null
+    private val advertisedNames = mutableMapOf<String, String>()
+
+    /** Read AD type 0x09 exactly as the official DG-Lab scanner does. */
+    private fun completeLocalName(record: ByteArray?): String? {
+        if (record == null) return null
+        var offset = 0
+        while (offset < record.size) {
+            val length = record[offset].toInt() and 0xff
+            if (length == 0 || offset + length >= record.size) break
+            val type = record[offset + 1].toInt() and 0xff
+            if (type == 0x09 && length > 1) {
+                return String(record, offset + 2, length - 1, StandardCharsets.UTF_8)
+                    .trimEnd('\u0000')
+                    .takeIf { it.isNotBlank() }
+            }
+            offset += length + 1
+        }
+        return null
+    }
 
     private fun markFirstPermissionRequest(perm: String) {
         val sharedPreference: SharedPreferences =
@@ -135,6 +154,7 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
 
         // clear old devices
         this.plugin.devices.clear()
+        advertisedNames.clear()
 
         var filters: ArrayList<ScanFilter?>? = null
         if (args.services.size > 0) {
@@ -146,22 +166,25 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
         val settings = ScanSettings.Builder()
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setLegacy(false)
+            // DG-Lab devices use legacy advertising. Several Android 11 OEM
+            // stacks omit their scan response when extended-only scanning is
+            // requested, which hides the AD 0x09 device name.
+            .setLegacy(true)
             .build()
 
         scanCb = object: ScanCallback(){
             private fun sendResult(result: ScanResult){
-                var name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    result.device.alias
-                } else {
-                    result.device.name
-                }
-                if (name==null){
-                    name = result.scanRecord?.deviceName
-                }
-                if (name == null) {
-                    name = ""
-                }
+                val currentName = completeLocalName(result.scanRecord?.bytes)
+                    ?: result.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
+                    ?: result.device.name?.takeIf { it.isNotBlank() }
+                    ?: if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        result.device.alias?.takeIf { it.isNotBlank() }
+                    } else null
+                if (currentName != null) advertisedNames[result.device.address] = currentName
+                // A device often emits the name in a scan response and omits
+                // it from the next advertising packet. Never erase a name we
+                // already observed for the same address.
+                val name = advertisedNames[result.device.address] ?: ""
                 val connected = this@BleClient.manager!!.getConnectionState(result.device,BluetoothProfile.GATT_SERVER) == BluetoothProfile.STATE_CONNECTED
                 val bonded = result.device.getBondState() == BluetoothDevice.BOND_BONDED
                 val txPower = if (result.txPower == TX_POWER_NOT_PRESENT) {
