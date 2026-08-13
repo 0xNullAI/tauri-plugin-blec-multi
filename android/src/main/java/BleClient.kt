@@ -23,6 +23,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.ParcelUuid
 import android.provider.Settings
+import android.util.Log
 import android.util.SparseArray
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
@@ -290,6 +291,19 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
                 // it from the next advertising packet. Never erase a name we
                 // already observed for the same address.
                 val name = advertisedNames[result.device.address] ?: ""
+                val debugManufacturer = advertisedManufacturerData[result.device.address]
+                val debugManufacturerText = if (debugManufacturer == null) "-" else
+                    (0 until debugManufacturer.size()).joinToString(",") { index ->
+                        val key = debugManufacturer.keyAt(index)
+                        val value = debugManufacturer.valueAt(index)
+                        "$key:${value.joinToString("") { byte -> "%02x".format(byte) }}"
+                    }
+                val debugServices = result.scanRecord?.serviceUuids
+                    ?.joinToString(",") { it.uuid.toString() } ?: "-"
+                Log.d(
+                    "BlecScanRaw",
+                    "address=${result.device.address} rssi=${result.rssi} name=$name mfr=$debugManufacturerText services=$debugServices"
+                )
                 val connected = this@BleClient.manager!!.getConnectionState(result.device,BluetoothProfile.GATT_SERVER) == BluetoothProfile.STATE_CONNECTED
                 val bonded = result.device.getBondState() == BluetoothDevice.BOND_BONDED
                 val txPower = if (result.txPower == TX_POWER_NOT_PRESENT) {
