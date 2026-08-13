@@ -97,6 +97,15 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
     private var manager: BluetoothManager? = null
     private var scanCb: ScanCallback? = null
     private val advertisedNames = mutableMapOf<String, String>()
+    private val advertisedManufacturerData = mutableMapOf<String, SparseArray<ByteArray>>()
+
+    private fun copyManufacturerData(source: SparseArray<ByteArray>): SparseArray<ByteArray> {
+        val copy = SparseArray<ByteArray>(source.size())
+        for (index in 0 until source.size()) {
+            copy.put(source.keyAt(index), source.valueAt(index).clone())
+        }
+        return copy
+    }
 
     /** Read AD type 0x09 exactly as the official DG-Lab scanner does. */
     private fun completeLocalName(record: ByteArray?): String? {
@@ -155,6 +164,7 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
         // clear old devices
         this.plugin.devices.clear()
         advertisedNames.clear()
+        advertisedManufacturerData.clear()
 
         var filters: ArrayList<ScanFilter?>? = null
         if (args.services.size > 0) {
@@ -181,6 +191,11 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
                         result.device.alias?.takeIf { it.isNotBlank() }
                     } else null
                 if (currentName != null) advertisedNames[result.device.address] = currentName
+                val currentManufacturerData = result.scanRecord?.manufacturerSpecificData
+                if (currentManufacturerData != null && currentManufacturerData.size() > 0) {
+                    advertisedManufacturerData[result.device.address] =
+                        copyManufacturerData(currentManufacturerData)
+                }
                 // A device often emits the name in a scan response and omits
                 // it from the next advertising packet. Never erase a name we
                 // already observed for the same address.
@@ -198,7 +213,11 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
                     result.rssi,
                     connected,
                     bonded,
-                    result.scanRecord?.manufacturerSpecificData,
+                    // Advertising and scan-response packets may arrive as
+                    // separate callbacks. Preserve AD 0xFF just like the AD
+                    // 0x09 name so a later partial packet cannot erase the
+                    // official DG-Lab anonymous-device fallback signal.
+                    advertisedManufacturerData[result.device.address],
                     result.scanRecord?.serviceData,
                     result.scanRecord?.serviceUuids,
                     txPower
