@@ -321,10 +321,10 @@ pub(crate) async fn list_services<R: Runtime>(
     address: String,
 ) -> Result<Vec<Service>> {
     let handler = get_handler()?;
-    let services = handler
-        .discover_services(&address)
-        .await
-        .expect("Unable to discover services");
+    // Discovery is also used to verify anonymous scan candidates. Nearby
+    // non-target devices commonly reject GATT connections; propagate that as
+    // a normal command error instead of panicking and terminating the app.
+    let services = handler.discover_services(&address).await?;
     Ok(services)
 }
 
