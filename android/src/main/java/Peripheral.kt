@@ -301,6 +301,31 @@ class Peripheral(
             value: ByteArray,
             status: Int
         ) {
+            processOnCharacteristicRead(characteristic, value, status)
+        }
+
+        // Android 12 and below dispatch the deprecated callback without a
+        // value argument. Without this overload the pending invoke is never
+        // resolved on those releases, so best-effort reads such as battery
+        // level time out even though the characteristic was read correctly.
+        @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            processOnCharacteristicRead(
+                characteristic,
+                characteristic.value ?: ByteArray(0),
+                status
+            )
+        }
+
+        private fun processOnCharacteristicRead(
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
             val key = Pair(characteristic.uuid, characteristic.service.uuid)
             val op = synchronized(this@Peripheral.onReadInvoke) {
                 this@Peripheral.onReadInvoke.remove(key)
