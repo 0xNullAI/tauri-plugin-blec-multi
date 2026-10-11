@@ -64,7 +64,8 @@ export async function stopScan() {
 
 /**
  * Check if necessary permissions are granted
- * @ param askIfDenied - If true, will ask the user for permissions again, if they were denied before
+ * @param askIfDenied - If true, shows the system permission request when permissions are missing.
+ *   If false, only reports whether they are granted and never shows a dialog.
  * @returns true if permissions are granted, false otherwise
  */
 export async function checkPermissions(askIfDenied = true): Promise<boolean> {

@@ -3,11 +3,7 @@ package com.plugin.blec
 
 import Peripheral
 import android.app.Activity
-import android.content.Intent
-import android.net.Uri
 import android.os.Build
-import android.provider.Settings
-import android.widget.Toast
 import app.tauri.PermissionState
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -55,7 +51,6 @@ class BleClientPlugin(private val activity: Activity): Plugin(activity) {
     private val client = BleClient(activity, this)
 
     private var pendingAllowIbeacons = false
-    private var pendingAskIfDenied = false
     
     @Command
     fun clear_devices(invoke: Invoke){
@@ -257,16 +252,18 @@ class BleClientPlugin(private val activity: Activity): Plugin(activity) {
     fun check_permissions(invoke: Invoke) {
         val args = invoke.parseArgs(CheckPermissionsParams::class.java)
         pendingAllowIbeacons = args.allowIbeacons
-        pendingAskIfDenied = args.askIfDenied
 
         val bluetoothAlias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) "bluetooth" else "bluetoothLegacy"
         val neededAliases = mutableListOf(bluetoothAlias)
         if (args.allowIbeacons) neededAliases.add("location")
 
         val allGranted = neededAliases.all { getPermissionState(it) == PermissionState.GRANTED }
-        if (allGranted) {
+        // askIfDenied=false only reports the current state: a background check (such as a
+        // prewarm scan at startup) must never put a system permission dialog in front of
+        // someone who has not asked to connect a device.
+        if (allGranted || !args.askIfDenied) {
             val ret = JSObject()
-            ret.put("result", true)
+            ret.put("result", allGranted)
             invoke.resolve(ret)
             return
         }
@@ -281,16 +278,8 @@ class BleClientPlugin(private val activity: Activity): Plugin(activity) {
         if (pendingAllowIbeacons) neededAliases.add("location")
 
         val allGranted = neededAliases.all { getPermissionState(it) == PermissionState.GRANTED }
-
-        if (!allGranted && pendingAskIfDenied) {
-            val intent = Intent(
-                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                Uri.parse("package:${activity.packageName}")
-            )
-            activity.startActivity(intent)
-            Toast.makeText(activity, "Please grant the 'Nearby devices' permission.", Toast.LENGTH_LONG).show()
-        }
-
+        // A refusal is reported, not answered by jumping to system settings: the app explains
+        // the permission in its own language and offers settings itself.
         val ret = JSObject()
         ret.put("result", allGranted)
         invoke.resolve(ret)
