@@ -16,3 +16,7 @@ node_modules/
 dist-js
 dist
 docs
+
+*.local
+.anthropic-api-key*
+*api-key*
