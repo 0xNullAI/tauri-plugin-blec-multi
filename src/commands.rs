@@ -307,12 +307,16 @@ pub(crate) async fn unsubscribe<R: Runtime>(
     Ok(())
 }
 
+/// Async on purpose. Tauri runs a sync command while it holds its plugin store lock, and on
+/// Android this command waits for the user to answer a system permission dialog. The main
+/// thread needs the same lock (for example when a page finishes loading), so a sync handler
+/// froze the app — "isn't responding" — until the dialog was answered.
 #[command]
-pub(crate) fn check_permissions(
-    _app: AppHandle<impl Runtime>,
+pub(crate) async fn check_permissions<R: Runtime>(
+    _app: AppHandle<R>,
     ask_if_denied: bool,
 ) -> Result<bool> {
-    crate::check_permissions(ask_if_denied)
+    tokio::task::spawn_blocking(move || crate::check_permissions(ask_if_denied)).await?
 }
 
 #[command]
