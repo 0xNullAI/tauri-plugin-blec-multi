@@ -15,6 +15,7 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 
 @InvokeArg
@@ -45,8 +46,10 @@ class ConnectParams{
     ]
 )
 class BleClientPlugin(private val activity: Activity): Plugin(activity) {
-    var devices: MutableMap<String, Peripheral> = mutableMapOf()
-    var connected_devices: MutableMap<String, Peripheral> = mutableMapOf()
+    // Written from scan callbacks (binder threads) while commands read them on
+    // other threads, so both maps must be concurrent.
+    val devices: MutableMap<String, Peripheral> = ConcurrentHashMap()
+    val connected_devices: MutableMap<String, Peripheral> = ConcurrentHashMap()
     var eventChannel: Channel? = null
     private val client = BleClient(activity, this)
 
@@ -184,6 +187,10 @@ class BleClientPlugin(private val activity: Activity): Plugin(activity) {
         // the write is guaranteed to be sent, if the connection persists,
         // but the plugin won't know when it has happened
         val skipWaitingForWriteToComplete: Boolean = false
+
+        // if true, this is a stop write: every queued write is rejected, the active
+        // write's wait is abandoned, and this one is sent next with response
+        val preempt: Boolean = false
     }
     
     @Command

@@ -50,6 +50,8 @@ class Peripheral(
     private val writeQueueLock = Any()
     private val writeQueue: ArrayDeque<PendingWrite> = ArrayDeque()
 
+    // Only replaced on the main thread; volatile so command threads see the current value.
+    @Volatile
     private var activeWrite: PendingWrite? = null
 
     private var onDescriptorInvoke: DescriptorOp? = null
@@ -58,11 +60,19 @@ class Peripheral(
 
     private val retryHandler = Handler(Looper.getMainLooper())
 
-    // maxAttempts for writes; only counts actual failure, waiting on the BT-chip (WRITE_REQUEST_BUSY) does not count as an attempt
+    // maxAttempts for reads and descriptor writes
     private val maxAttempts = 100
+    // Characteristic writes are capped much lower: every attempt is a real transmission (or a refused start),
+    // and a write that keeps failing must not hold up the queue - in particular a following stop packet.
+    // Waiting on the BT-chip (WRITE_REQUEST_BUSY) does not count as an attempt, but is bounded by writeBusyLimitMs.
+    private val maxWriteAttempts = 3
+    private val writeBusyLimitMs = 1000L
     private val writeRetryDelayMs = 50L
     private val writeCallbackWaitNoResponseMs = 500L
     private val writeCallbackWaitWithResponseMs = 750L
+    // Deadline for a preemptive (stop) write that was given no explicit timeout.
+    private val preemptDefaultTimeoutMs = 3000L
+    private val processWriteQueueRunnable = Runnable { processWriteQueue() }
 
     private val writeCount: AtomicInt = AtomicInt(0)
 
@@ -77,9 +87,15 @@ class Peripheral(
         var invoke: Invoke?,
         val data: ByteArray,
         val withResponse: Boolean,
+        // number of failed attempts so far
         var attempt: Int = 0,
         val timeoutAfter: Long = 0L,
         var timeSentAt: Long = 0L,
+        // System.nanoTime() of the last successful start, used to tell this write's callback from a late one
+        var sentAtNanos: Long = 0L,
+        // first time the stack refused to start this write as busy, 0 if not waiting
+        var busySince: Long = 0L,
+        val preempt: Boolean = false,
     )
 
     private data class ReadOp(
@@ -124,17 +140,37 @@ class Peripheral(
                 // be closed to release the underlying client interface,
                 // otherwise repeated connect/disconnect cycles run into the
                 // 30 client limit and start failing with status 133.
+                //
+                // Always close the instance this callback belongs to. A late
+                // failure from an earlier connect attempt carries that attempt's
+                // gatt; it must not close, clear or report on a newer connection.
+                val currentGatt = this@Peripheral.gatt
+                if (gatt != null && currentGatt != null && gatt !== currentGatt) {
+                    Log.w("Peripheral", "Ignoring state change $newState (status $status) from a stale gatt")
+                    try {
+                        gatt.close()
+                    } catch (e: Exception) {
+                        Log.w("Peripheral", "Failed to close stale gatt: ${e.message}")
+                    }
+                    return
+                }
                 this@Peripheral.connected = false
-                val existingGatt = this@Peripheral.gatt ?: gatt
+                val ownGatt = gatt ?: currentGatt
                 this@Peripheral.gatt = null
                 // Drop the notification channel: its rust receiver is torn down
                 // with the connection, and sending into a dead channel is both
                 // pointless and a source of late-callback races.
                 this@Peripheral.notifyChannel = null
                 try {
-                    existingGatt?.close()
+                    ownGatt?.close()
                 } catch (e: Exception) {
                     Log.w("Peripheral", "Failed to close gatt: ${e.message}")
+                }
+                // Fail every write queued before this point. Writes queued after it
+                // (for a reconnect that is already starting) are left alone.
+                val cutoff = this@Peripheral.writeCount.get()
+                runOnMain {
+                    this@Peripheral.failPendingWrites(cutoff, "Device disconnected before the write completed")
                 }
                 val error = if (status != BluetoothGatt.GATT_SUCCESS) {
                     "Connection failed. Status: $status (${statusCodeName(status)}), State: $newState"
@@ -237,53 +273,67 @@ class Peripheral(
         ) {
             val nonNullGatt = gatt ?: return
             val nonNullCharacteristic = characteristic ?: return
-            
+            val arrivedAt = System.nanoTime()
+            // Below Android 13 the written bytes are echoed in the shared characteristic
+            // object; read them here before a later write on the main thread replaces them.
+            @Suppress("DEPRECATION")
+            val value = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                nonNullCharacteristic.value ?: ByteArray(0)
+            } else {
+                null
+            }
+
             runOnMain {
-                processOnCharWrite(nonNullGatt, nonNullCharacteristic, status)
+                processOnCharWrite(nonNullGatt, nonNullCharacteristic, status, value, arrivedAt)
             }
         }
 
-        @Suppress("OVERRIDE_DEPRECATION")
         fun processOnCharWrite(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
-            status: Int
+            status: Int,
+            value: ByteArray?,
+            arrivedAt: Long
         ) {
             Log.v("Peripheral", "onCharacteristicWrite for ${characteristic.uuid} with status $status")
             val key = Pair(characteristic.uuid, characteristic.service.uuid)
-            
-            @Suppress("DEPRECATION")
-            val value = characteristic.value ?: ByteArray(0)
 
+            // A callback can only belong to the active write if that write was started
+            // before the callback arrived. Anything else is the late callback of a write
+            // that was abandoned (window elapsed or superseded by a stop) on the same
+            // characteristic, and must not complete the write that replaced it.
             val current = this@Peripheral.activeWrite
-            if (current == null || current.key != key) {
+            if (current == null || current.key != key || current.timeSentAt == 0L || arrivedAt < current.sentAtNanos) {
                 Log.w("Peripheral", "Received stale write callback for $key, ignoring")
                 return
             }
 
             var success = status == BluetoothGatt.GATT_SUCCESS
-            if (success && current.withResponse) {
+            // Android 13+ writes through writeCharacteristic(c, data, type), which never
+            // updates characteristic.value, so there only the callback status counts.
+            if (success && current.withResponse && value != null) {
                 success = value.contentEquals(current.data)
             }
 
             if (success) {
-                Log.v("Peripheral", "Write with id $current.id succeeded!")
-                this@Peripheral.activeWrite = null
-                current.invoke?.resolve()
+                Log.v("Peripheral", "Write with id ${current.id} succeeded!")
+                this@Peripheral.finishWrite(current, null)
+            } else if (!current.withResponse) {
+                // Never resend a write without response: it may already have been applied.
+                this@Peripheral.finishWrite(
+                    current,
+                    "Write without response to characteristic ${characteristic.uuid} failed with status $status (${statusCodeName(status)})"
+                )
             } else {
                 current.timeSentAt = 0L
-
-                Log.v("Peripheral", "Write with id $current.id attempt $current.attempt failed!")
-
-                if (current.attempt < this@Peripheral.maxAttempts && !this@Peripheral.isWriteTimedOut(current)) {
-                    current.attempt += 1
-                    Log.w(
-                        "Peripheral",
-                        "Write on ${characteristic.uuid} failed (status $status, attempt ${current.attempt}/${this@Peripheral.maxAttempts})"
-                    )
-                } else {
-                    this@Peripheral.activeWrite = null
-                    current.invoke?.reject(
+                current.attempt += 1
+                Log.w(
+                    "Peripheral",
+                    "Write on ${characteristic.uuid} failed (status $status, attempt ${current.attempt}/${this@Peripheral.maxWriteAttempts})"
+                )
+                if (current.attempt >= this@Peripheral.maxWriteAttempts || this@Peripheral.isWriteTimedOut(current)) {
+                    this@Peripheral.finishWrite(
+                        current,
                         "Write to characteristic ${characteristic.uuid} failed after ${current.attempt} attempts with status $status (${
                             statusCodeName(
                                 status
@@ -593,6 +643,10 @@ class Peripheral(
         }
 
         val id = this.writeCount.getAndIncrement()
+        if (args.preempt) {
+            preemptWrite(invoke, args, id, key, charac)
+            return
+        }
         val timeoutAfter = if (args.timeout > 0) System.currentTimeMillis() + args.timeout else 0L
         val op = PendingWrite(id, key, charac, null, args.data!!, args.withResponse, timeoutAfter = timeoutAfter)
         if (!args.skipWaitingForWriteToComplete) {
@@ -625,75 +679,184 @@ class Peripheral(
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun processWriteQueue() {
-        // this function always runs on the main thread; therefore we do not need to synchronize activeWrite
-        if (this.activeWrite == null) {
-            synchronized(this.writeQueueLock) {
-                // filter timed-out or over-attempt writes out of the queue before starting the next one
-                val to_reject: MutableList<PendingWrite> = mutableListOf()
-
-                if (this.activeWrite == null) {
-                    val queueSize = this.writeQueue.size
-                    var iter = 0;
-                    while (iter < queueSize) {
-                        val pendingWrite = this.writeQueue.removeFirst()
-                        if (pendingWrite.attempt > maxAttempts || isWriteTimedOut(pendingWrite)) {
-                            to_reject.add(pendingWrite)
-                        } else {
-                            this.writeQueue.addLast(pendingWrite)
-                        }
-                        iter++
-                    }
-                }
-
-                for (iter in to_reject) {
-                    if (iter.attempt > maxAttempts) {
-                        Log.w(
-                            "Peripheral",
-                            "Discarding queued write to ${iter.key.first} after ${iter.attempt} attempts without success"
-                        )
-                    } else {
-                        Log.w(
-                            "Peripheral",
-                            "Discarding queued write to ${iter.key.first} that timed out in queue after waiting for ${iter.timeoutAfter - System.currentTimeMillis()} ms"
-                        )
-                    }
-                }
-
-                if (this.writeQueue.isNotEmpty()) {
-                    this.activeWrite = this.writeQueue.removeFirst()
+    /**
+     * A stop packet must never wait behind queued packets. Every queued write is
+     * rejected, the active write's wait is abandoned, and the stop is sent next, with
+     * response and up to [maxWriteAttempts] attempts. Writes queued after this call
+     * go behind the stop.
+     */
+    private fun preemptWrite(
+        invoke: Invoke,
+        args: BleClientPlugin.WriteParams,
+        id: Int,
+        key: Pair<UUID, UUID>,
+        charac: BluetoothGattCharacteristic
+    ) {
+        val timeoutMs = if (args.timeout > 0) args.timeout.toLong() else preemptDefaultTimeoutMs
+        val op = PendingWrite(
+            id, key, charac, invoke, args.data!!, true,
+            timeoutAfter = System.currentTimeMillis() + timeoutMs,
+            preempt = true,
+        )
+        val dropped = synchronized(this.writeQueueLock) {
+            val queued = ArrayList(this.writeQueue)
+            this.writeQueue.clear()
+            this.writeQueue.addFirst(op)
+            queued
+        }
+        for (write in dropped) {
+            write.invoke?.reject("Write superseded by stop")
+        }
+        if (dropped.isNotEmpty()) {
+            Log.w("Peripheral", "Stop write dropped ${dropped.size} queued writes")
+        }
+        runOnMain {
+            val abandoned = synchronized(this.writeQueueLock) {
+                val active = this.activeWrite
+                if (active != null && active !== op) {
+                    this.activeWrite = null
+                    active
+                } else {
+                    null
                 }
             }
+            if (abandoned != null) {
+                if (abandoned.timeSentAt > 0L && !abandoned.withResponse) {
+                    // already handed to the stack; the stop follows it
+                    abandoned.invoke?.resolve()
+                } else {
+                    abandoned.invoke?.reject("Write superseded by stop")
+                }
+            }
+            processWriteQueue()
+        }
+    }
+
+    /** Clears [op] as the active write (if it still is) and completes its invoke. */
+    private fun finishWrite(op: PendingWrite, error: String?) {
+        synchronized(this.writeQueueLock) {
+            if (this.activeWrite === op) {
+                this.activeWrite = null
+            }
+        }
+        if (error == null) {
+            op.invoke?.resolve()
+        } else {
+            Log.w("Peripheral", error)
+            op.invoke?.reject(error)
+        }
+    }
+
+    /**
+     * Rejects the active write and every queued write whose id is below [cutoffId].
+     * Runs on the main thread.
+     */
+    private fun failPendingWrites(cutoffId: Int, reason: String) {
+        val failed: MutableList<PendingWrite> = mutableListOf()
+        val remaining = synchronized(this.writeQueueLock) {
+            val active = this.activeWrite
+            if (active != null && active.id < cutoffId) {
+                failed.add(active)
+                this.activeWrite = null
+            }
+            val iter = this.writeQueue.iterator()
+            while (iter.hasNext()) {
+                val next = iter.next()
+                if (next.id < cutoffId) {
+                    failed.add(next)
+                    iter.remove()
+                }
+            }
+            this.activeWrite != null || this.writeQueue.isNotEmpty()
+        }
+        for (write in failed) {
+            write.invoke?.reject(reason)
+        }
+        if (failed.isNotEmpty()) {
+            Log.w("Peripheral", "Failed ${failed.size} pending writes: $reason")
+        }
+        if (remaining) {
+            scheduleProcessWriteQueue(writeRetryDelayMs)
+        } else {
+            retryHandler.removeCallbacks(processWriteQueueRunnable)
+        }
+    }
+
+    /** Runs [processWriteQueue] after [delayMs], replacing any earlier scheduled run. */
+    private fun scheduleProcessWriteQueue(delayMs: Long) {
+        retryHandler.removeCallbacks(processWriteQueueRunnable)
+        retryHandler.postDelayed(processWriteQueueRunnable, delayMs.coerceAtLeast(1L))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun processWriteQueue() {
+        // this function always runs on the main thread; activeWrite is only replaced here and in
+        // other main-thread helpers, under writeQueueLock so command threads see a consistent queue
+        val expired: MutableList<PendingWrite> = mutableListOf()
+        synchronized(this.writeQueueLock) {
+            if (this.activeWrite == null) {
+                // filter timed-out writes out of the queue before starting the next one
+                val iter = this.writeQueue.iterator()
+                while (iter.hasNext()) {
+                    val next = iter.next()
+                    if (isWriteTimedOut(next)) {
+                        expired.add(next)
+                        iter.remove()
+                    }
+                }
+                this.activeWrite = this.writeQueue.pollFirst()
+            }
+        }
+        for (write in expired) {
+            Log.w("Peripheral", "Discarding queued write to ${write.key.first} that timed out in queue")
+            write.invoke?.reject("Write to characteristic ${write.key.first} timed out in queue")
         }
 
         val current = this.activeWrite ?: return
+        val now = System.currentTimeMillis()
         // already sent, waiting for onCharacteristicWrite callback.
         if (current.timeSentAt > 0L) {
-            val elapsedSinceSent = System.currentTimeMillis() - current.timeSentAt
-
-            val waitUntilRetry =
-                if (current.withResponse) {
-                    writeCallbackWaitWithResponseMs
-                } else {
-                    writeCallbackWaitNoResponseMs
-                };
-
-            if (elapsedSinceSent < waitUntilRetry) {
-                retryHandler.postDelayed(
-                    { processWriteQueue() }, waitUntilRetry
-                )
+            val window = callbackWaitMs(current)
+            val elapsedSinceSent = now - current.timeSentAt
+            if (elapsedSinceSent < window) {
+                scheduleProcessWriteQueue(window - elapsedSinceSent)
                 return
             }
 
-            // Callback window elapsed without a response — resend.
+            if (!current.withResponse) {
+                // Never resend a write without response. The packet was handed to the
+                // stack and may already have been applied; a relative-strength packet
+                // sent twice would be applied twice. A missing callback means done.
+                Log.d("Peripheral", "No write callback for ${current.characteristic.uuid} within ${window} ms, treating as sent")
+                finishWrite(current, null)
+                return processWriteQueue()
+            }
+
+            // With response: a missing callback counts as a failed attempt.
             current.timeSentAt = 0L
+            current.attempt += 1
+            if (current.attempt >= maxWriteAttempts || isWriteTimedOut(current)) {
+                finishWrite(
+                    current,
+                    "Write to characteristic ${current.characteristic.uuid} got no response after ${current.attempt} attempts"
+                )
+                return processWriteQueue()
+            }
+            Log.w(
+                "Peripheral",
+                "No response for write on ${current.characteristic.uuid} within ${window} ms, resending (attempt ${current.attempt + 1}/$maxWriteAttempts)"
+            )
         }
 
         val charac = current.characteristic
         val op = current
-        // TODO: ensure we correctly clear write queue when disconnecting -- should we trigger a disconnect here if gatt is null??
-        val gatt = this.gatt ?: return
+        val gatt = this.gatt
+        if (gatt == null) {
+            // Not connected: nothing in the queue can be sent. Fail it all instead of
+            // leaving the active write stuck until the caller times out.
+            failPendingWrites(Int.MAX_VALUE, "No gatt server connected")
+            return
+        }
         val writeType = if (op.withResponse) {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         } else {
@@ -707,65 +870,61 @@ class Peripheral(
             charac.writeType = writeType
             @Suppress("DEPRECATION")
             charac.value = op.data
+            // The legacy API only reports false, most often because another operation
+            // is still in flight. Treat it like WRITE_REQUEST_BUSY: nothing was sent.
             @Suppress("DEPRECATION")
             if (gatt.writeCharacteristic(charac)) {
                 BluetoothGatt.GATT_SUCCESS
             } else {
-                BluetoothGatt.GATT_FAILURE
+                BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY
             }
         }
 
-        if (status != BluetoothGatt.GATT_SUCCESS) {
-            if (status == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY) {
-                discardTimedOutQueuedWrites()
-            } else {
-                Log.w(
-                    "Peripheral",
-                    "Failed to start write on ${charac.uuid} (status $status, attempt ${op.attempt}/$maxAttempts)"
-                )
-                op.attempt += 1
-            }
-
-            if (isWriteTimedOut(op)) {
-                synchronized(this.writeQueueLock) {
-                    if (this.activeWrite == current) {
-                        this.activeWrite = null
-                    }
-                }
-                op.invoke?.reject("Write to characteristic ${charac.uuid} timed out")
-                return processWriteQueue()
-            }
-
-            if (op.attempt < maxAttempts) {
-                synchronized(this.writeQueueLock) {
-                    if (this.activeWrite == current) {
-                        this.activeWrite = op
-                    }
-                }
-                retryHandler.postDelayed({
-                    processWriteQueue()
-                }, writeRetryDelayMs)
-            } else {
-                synchronized(this.writeQueueLock) {
-                    if (this.activeWrite == current) {
-                        this.activeWrite = null
-                    }
-                }
-                op.invoke?.reject(
-                    "Failed to start write on characteristic ${charac.uuid} after ${op.attempt} attempts: status $status (${
-                        statusCodeName(
-                            status
-                        )
-                    })"
-                )
-                return processWriteQueue()
-            }
-        } else {
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            op.busySince = 0L
             op.timeSentAt = System.currentTimeMillis()
-            retryHandler.postDelayed({
-                processWriteQueue()
-            }, 5L)
+            op.sentAtNanos = System.nanoTime()
+            scheduleProcessWriteQueue(callbackWaitMs(op))
+            return
         }
+
+        if (status == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY) {
+            // Not sent, so retrying cannot apply the packet twice. A stop write keeps
+            // trying until its own deadline: the stack stays busy until the write it
+            // superseded completes.
+            if (op.busySince == 0L) {
+                op.busySince = now
+            }
+            if ((!op.preempt && now - op.busySince >= writeBusyLimitMs) || isWriteTimedOut(op)) {
+                finishWrite(
+                    op,
+                    "Write to characteristic ${charac.uuid} was not accepted by the Bluetooth stack within ${now - op.busySince} ms (busy)"
+                )
+                return processWriteQueue()
+            }
+            discardTimedOutQueuedWrites()
+            scheduleProcessWriteQueue(writeRetryDelayMs)
+            return
+        }
+
+        // Failed to start; nothing was sent, so a bounded retry is safe for both write types.
+        op.attempt += 1
+        Log.w(
+            "Peripheral",
+            "Failed to start write on ${charac.uuid} (status $status, attempt ${op.attempt}/$maxWriteAttempts)"
+        )
+        if (op.attempt >= maxWriteAttempts || isWriteTimedOut(op)) {
+            finishWrite(
+                op,
+                "Failed to start write on characteristic ${charac.uuid} after ${op.attempt} attempts: status $status (${
+                    statusCodeName(
+                        status
+                    )
+                })"
+            )
+            return processWriteQueue()
+        }
+        scheduleProcessWriteQueue(writeRetryDelayMs)
     }
 
     private fun callbackWaitMs(op: PendingWrite): Long {

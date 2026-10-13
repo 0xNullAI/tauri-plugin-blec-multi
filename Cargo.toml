@@ -30,6 +30,10 @@ serde_json = "1"
 tokio-stream = "0.1.16"
 base64 = "0.22.1"
 
+[dev-dependencies]
+# paused clock for the safety watchdog tests
+tokio = { version = "1.40.0", features = ["rt", "time", "sync", "test-util"] }
+
 [build-dependencies]
 tauri-plugin = { version = "2.0.1", features = ["build"] }
 tauri-build = "2.0.1"

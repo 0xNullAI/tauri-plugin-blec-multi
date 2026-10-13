@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-safety-stop"
+description = "Enables the safety_stop command without any pre-configured scope."
+commands.allow = ["safety_stop"]
+
+[[permission]]
+identifier = "deny-safety-stop"
+description = "Denies the safety_stop command without any pre-configured scope."
+commands.deny = ["safety_stop"]

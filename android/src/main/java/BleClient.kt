@@ -35,6 +35,7 @@ import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import java.util.Base64
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 
 class BleDevice(
     val address: String,
@@ -98,8 +99,19 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
     private var manager: BluetoothManager? = null
     private var scanCb: ScanCallback? = null
     private var legacyScanCb: BluetoothAdapter.LeScanCallback? = null
-    private val advertisedNames = mutableMapOf<String, String>()
-    private val advertisedManufacturerData = mutableMapOf<String, SparseArray<ByteArray>>()
+    // Filled from scan callbacks, which the legacy API delivers on binder threads.
+    private val advertisedNames: MutableMap<String, String> = ConcurrentHashMap()
+    private val advertisedManufacturerData: MutableMap<String, SparseArray<ByteArray>> = ConcurrentHashMap()
+
+    /**
+     * The Peripheral to store for a scanned device. A device that is connected (or
+     * connecting) keeps its existing object: replacing it would orphan the live gatt,
+     * its write queue and its notification channel.
+     */
+    private fun peripheralFor(device: BluetoothDevice): Peripheral {
+        return this.plugin.connected_devices[device.address]
+            ?: Peripheral(this.activity, device, this.plugin)
+    }
 
     private fun copyManufacturerData(source: SparseArray<ByteArray>): SparseArray<ByteArray> {
         val copy = SparseArray<ByteArray>(source.size())
@@ -238,6 +250,13 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
         // API, losing AD 0x09 even though the old callback returns the merged
         // raw record. Use that platform compatibility path on those releases.
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.R) {
+            // This path never sets scanCb, so the "already running" check above does
+            // not cover it. Stop a previous legacy scan instead of leaking its callback.
+            legacyScanCb?.let { previous ->
+                @Suppress("DEPRECATION")
+                adapter?.stopLeScan(previous)
+                legacyScanCb = null
+            }
             legacyScanCb = BluetoothAdapter.LeScanCallback { device, rssi, scanRecord ->
                 val currentName = completeLocalName(scanRecord)
                     ?: device.name?.takeIf { it.isNotBlank() }
@@ -260,8 +279,7 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
                     parseServiceUuids(scanRecord),
                     null
                 )
-                this@BleClient.plugin.devices[bleDevice.address] =
-                    Peripheral(this@BleClient.activity, device, this@BleClient.plugin)
+                this@BleClient.plugin.devices[bleDevice.address] = peripheralFor(device)
                 val res = JSObject()
                 res.put("result", bleDevice.toJsObject())
                 args.onDevice!!.send(res)
@@ -312,7 +330,7 @@ class BleClient(private val activity: Activity, private val plugin: BleClientPlu
                     result.scanRecord?.serviceUuids,
                     txPower
                 )
-                this@BleClient.plugin.devices[device.address] = Peripheral(this@BleClient.activity, result.device, this@BleClient.plugin)
+                this@BleClient.plugin.devices[device.address] = peripheralFor(result.device)
                 val res = JSObject()
                 res.put("result", device.toJsObject())
                 args.onDevice!!.send(res)

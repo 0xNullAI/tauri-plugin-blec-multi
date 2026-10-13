@@ -242,9 +242,8 @@ mod tests {
 
     #[test]
     fn char_props_round_trip_through_bitflags() {
-        let flags = get_flags(
-            btleplug::api::CharPropFlags::READ | btleplug::api::CharPropFlags::NOTIFY,
-        );
+        let flags =
+            get_flags(btleplug::api::CharPropFlags::READ | btleplug::api::CharPropFlags::NOTIFY);
         assert!(flags.contains(CharProps::Read));
         assert!(flags.contains(CharProps::Notify));
         assert!(!flags.contains(CharProps::Write));

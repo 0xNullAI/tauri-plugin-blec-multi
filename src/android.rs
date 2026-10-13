@@ -354,6 +354,35 @@ impl BondingPeripheral for Peripheral {
         Ok(res.result)
     }
 }
+impl Peripheral {
+    /// Writes `data` ahead of everything queued for this device: the Kotlin side
+    /// rejects all queued writes ("superseded by stop"), abandons the active write's
+    /// wait, and sends this one next, with response and up to 3 attempts. Used for
+    /// the safety stop; the caller does not take the per-device GATT op lock.
+    pub(crate) async fn write_preemptive(
+        &self,
+        characteristic: &Characteristic,
+        data: &[u8],
+    ) -> Result<()> {
+        call_plugin_with_timeout::<_, ()>(
+            "write",
+            serde_json::json!({
+                "address": self.address,
+                "characteristic": characteristic.uuid,
+                "service": characteristic.service_uuid,
+                "data": data,
+                "withResponse": true,
+                // 0 lets the Kotlin side apply its own deadline for stop writes
+                "timeout": 0,
+                "skipWaitingForWriteToComplete": false,
+                "preempt": true
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 #[allow(dependency_on_unit_never_type_fallback)]
 #[async_trait::async_trait]
 impl btleplug::api::Peripheral for Peripheral {
@@ -405,15 +434,20 @@ impl btleplug::api::Peripheral for Peripheral {
         struct ServicesResult {
             result: Vec<ResService>,
         }
-        let res: ServicesResult = get_handle()
-            .run_mobile_plugin(
-                "services",
-                ConnectParams {
-                    address: self.address,
-                },
-            )
-            .map_err(|e| btleplug::Error::RuntimeError(e.to_string()))
-            .expect("failed to get services");
+        // The trait gives no way to return an error here. An empty set makes later
+        // lookups fail with CharacNotAvailable instead of panicking the caller's task.
+        let res: ServicesResult = match get_handle().run_mobile_plugin(
+            "services",
+            ConnectParams {
+                address: self.address,
+            },
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("failed to get services for {}: {e}", self.address);
+                return BTreeSet::new();
+            }
+        };
         let mut services = BTreeSet::new();
         for s in res.result {
             let mut characteristics = BTreeSet::new();

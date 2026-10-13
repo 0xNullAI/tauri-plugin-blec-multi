@@ -363,3 +363,59 @@ export async function setWriteBehavior(
 export async function setAndroidMtu(mtu: number): Promise<void> {
   await invoke("plugin:blec|set_android_mtu", { mtu });
 }
+
+/** Outcome of a safety stop for one device. */
+export type SafetyStopOutcome = {
+  address: string;
+  ok: boolean;
+  error: string | null;
+};
+
+/**
+ * Register (or replace) the safety stop recipe for a connected device: writing
+ * `packet` to `characteristic` in `service` makes the device stop. The plugin
+ * never interprets the bytes. The recipe is cleared when the device disconnects.
+ * @param address - The address of the connected device.
+ * @param service - UUID of the service that holds the characteristic.
+ * @param characteristic - UUID of the characteristic the stop packet is written to.
+ * @param packet - The stop packet. Must not be empty.
+ * @param watchdogMs - Optional, at least 300. If no `send` to the device happens
+ * within this time, the stop packet is written once; the next send rearms it.
+ */
+export async function setSafetyStop(
+  address: string,
+  service: string,
+  characteristic: string,
+  packet: number[],
+  watchdogMs?: number
+): Promise<void> {
+  await invoke("plugin:blec|set_safety_stop", {
+    address,
+    service,
+    characteristic,
+    packet,
+    watchdogMs,
+  });
+}
+
+/**
+ * Remove the safety stop recipe for a device and cancel its watchdog.
+ * @param address - The address of the device.
+ */
+export async function clearSafetyStop(address: string): Promise<void> {
+  await invoke("plugin:blec|clear_safety_stop", { address });
+}
+
+/**
+ * Write the registered stop packet ahead of every queued write, to one device or,
+ * when `address` is omitted, to every device with a recipe. Rejects only if every
+ * attempted device failed.
+ * @param address - The address of the device. Omit to stop every registered device.
+ */
+export async function safetyStop(
+  address?: string
+): Promise<SafetyStopOutcome[]> {
+  return await invoke<SafetyStopOutcome[]>("plugin:blec|safety_stop", {
+    address,
+  });
+}

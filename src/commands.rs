@@ -1,12 +1,58 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
 use tauri::{async_runtime, command, AppHandle, Runtime};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use crate::error::Result;
 use crate::models::{AdapterState, BleDevice, ScanFilter, Service, WriteType};
+use crate::safety::SafetyStopOutcome;
 use crate::{get_handler, OnDisconnectHandler};
+
+/// Notifications buffered per subscription between the BLE callback and the
+/// task that forwards them to the front-end. Enough for a burst; the callback
+/// never blocks, so anything beyond this is dropped.
+const SUBSCRIBE_BUFFER: usize = 128;
+/// At most one "dropping notifications" warning per subscription per interval.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Counts notifications dropped because the forwarding task is behind, and
+/// warns at most once per [`DROP_WARN_INTERVAL`].
+struct DropWarner {
+    start: Instant,
+    dropped: AtomicU64,
+    /// ms since `start` of the last warning, `u64::MAX` before the first
+    last_warn_ms: AtomicU64,
+}
+
+impl DropWarner {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            dropped: AtomicU64::new(0),
+            last_warn_ms: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    fn record(&self, characteristic: Uuid) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        let now = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        let last = self.last_warn_ms.load(Ordering::Relaxed);
+        let due =
+            last == u64::MAX || now.saturating_sub(last) >= DROP_WARN_INTERVAL.as_millis() as u64;
+        if due
+            && self
+                .last_warn_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let dropped = self.dropped.swap(0, Ordering::Relaxed);
+            warn!("dropped {dropped} notifications from {characteristic}: the front-end is not keeping up");
+        }
+    }
+}
 
 #[command]
 pub(crate) async fn scan<R: Runtime>(
@@ -169,7 +215,7 @@ pub(crate) async fn send<R: Runtime>(
     write_type: WriteType,
     address: Option<String>,
 ) -> Result<()> {
-    info!("Sending data: {data:?}");
+    trace!("Sending data: {data:?}");
     let handler = get_handler()?;
     match address {
         Some(address) => {
@@ -226,7 +272,7 @@ pub(crate) async fn recv_string<R: Runtime>(
     address: Option<String>,
 ) -> Result<String> {
     let data = recv(app, characteristic, service, address).await?;
-    Ok(String::from_utf8(data).expect("failed to convert data to string"))
+    Ok(String::from_utf8(data)?)
 }
 
 async fn subscribe_channel(
@@ -235,11 +281,16 @@ async fn subscribe_channel(
     address: Option<String>,
 ) -> Result<mpsc::Receiver<Vec<u8>>> {
     let handler = get_handler()?;
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBE_BUFFER);
+    let drops = DropWarner::new();
     let callback = move |data: Vec<u8>| {
-        info!("subscribe_channel: {:?}", data);
-        tx.try_send(data)
-            .expect("failed to send data to the channel");
+        trace!("subscribe_channel: {:?}", data);
+        match tx.try_send(data) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => drops.record(characteristic),
+            // the forwarding task ended (front-end gone); nothing to do until unsubscribe
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     };
     match address {
         Some(address) => {
@@ -264,9 +315,11 @@ pub(crate) async fn subscribe<R: Runtime>(
     let mut rx = subscribe_channel(characteristic, service, address).await?;
     async_runtime::spawn(async move {
         while let Some(data) = rx.recv().await {
-            on_data
-                .send(data)
-                .expect("failed to send data to the front-end");
+            if let Err(e) = on_data.send(data) {
+                // e.g. the page was reloaded; stop forwarding quietly
+                debug!("notification receiver for {characteristic} is gone: {e}");
+                break;
+            }
         }
     });
     Ok(())
@@ -283,11 +336,12 @@ pub(crate) async fn subscribe_string<R: Runtime>(
     let mut rx = subscribe_channel(characteristic, service, address).await?;
     async_runtime::spawn(async move {
         while let Some(data) = rx.recv().await {
-            info!("subscribe_string: {:?}", data);
-            let data = String::from_utf8(data).expect("failed to convert data to string");
-            on_data
-                .send(data)
-                .expect("failed to send data to the front-end");
+            trace!("subscribe_string: {:?}", data);
+            let data = String::from_utf8_lossy(&data).into_owned();
+            if let Err(e) = on_data.send(data) {
+                debug!("notification receiver for {characteristic} is gone: {e}");
+                break;
+            }
         }
     });
     Ok(())
@@ -360,6 +414,47 @@ pub(crate) async fn mtu<R: Runtime>(_app: AppHandle<R>, address: Option<String>)
     Ok(mtu)
 }
 
+/// Registers or replaces the safety stop recipe for a connected device. The
+/// plugin never interprets `packet`; it writes it to `characteristic` when a stop
+/// is needed. `watchdog_ms` (at least 300) writes the stop once if no `send` to
+/// the device happens within that time.
+#[command]
+pub(crate) async fn set_safety_stop<R: Runtime>(
+    _app: AppHandle<R>,
+    address: String,
+    service: Uuid,
+    characteristic: Uuid,
+    packet: Vec<u8>,
+    watchdog_ms: Option<u64>,
+) -> Result<()> {
+    let handler = get_handler()?;
+    handler
+        .set_safety_stop(&address, service, characteristic, packet, watchdog_ms)
+        .await
+}
+
+#[command]
+pub(crate) async fn clear_safety_stop<R: Runtime>(
+    _app: AppHandle<R>,
+    address: String,
+) -> Result<()> {
+    let handler = get_handler()?;
+    handler.clear_safety_stop(&address);
+    Ok(())
+}
+
+/// Writes the stop packet preemptively to one device, or to every device with a
+/// recipe when `address` is omitted. Returns the outcome per device and errors
+/// only if every attempted device failed.
+#[command]
+pub(crate) async fn safety_stop<R: Runtime>(
+    _app: AppHandle<R>,
+    address: Option<String>,
+) -> Result<Vec<SafetyStopOutcome>> {
+    let handler = get_handler()?;
+    handler.safety_stop(address.as_deref()).await
+}
+
 #[command]
 pub(crate) fn set_write_behavior<R: Runtime>(
     _app: AppHandle<R>,
@@ -406,6 +501,9 @@ pub fn commands<R: Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool {
         get_adapter_state,
         mtu,
         set_write_behavior,
-        set_android_mtu
+        set_android_mtu,
+        set_safety_stop,
+        clear_safety_stop,
+        safety_stop
     ]
 }

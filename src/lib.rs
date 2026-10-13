@@ -13,10 +13,12 @@ mod commands;
 mod error;
 mod handler;
 pub mod models;
+mod safety;
 
 pub use error::Error;
 pub use handler::Handler;
 pub use handler::{OnDisconnectHandler, SubscriptionHandler};
+pub use safety::{SafetyStopOutcome, StopRecipe, MIN_WATCHDOG};
 
 pub static ALLOW_IBEACONS: AtomicBool = AtomicBool::new(false);
 

@@ -1,5 +1,6 @@
 use crate::error::Error;
 use crate::models::{self, AdapterState, BleDevice, ScanFilter, Service};
+use crate::safety::{self, SafetyStopOutcome, SafetyStops, StopRecipe, StopSink};
 use crate::ALLOW_IBEACONS;
 use btleplug::api::{Central, Characteristic, Manager as _, Peripheral as _};
 use btleplug::api::{CentralEvent, CentralState};
@@ -20,6 +21,77 @@ use uuid::Uuid;
 use crate::android::{Adapter, Manager, Peripheral};
 #[cfg(not(target_os = "android"))]
 use btleplug::platform::{Adapter, Manager, Peripheral};
+
+/// How long to wait for the adapter event that confirms a connect or disconnect.
+const CONNECTION_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The two ways a characteristic gets written. Normal writes go through the
+/// per-device GATT operation lock; preemptive (safety stop) writes never take it.
+/// A trait so the lock behaviour can be tested without a BLE adapter.
+#[async_trait::async_trait]
+pub(crate) trait GattWriter: Send + Sync {
+    async fn write_normal(
+        &self,
+        charac: &Characteristic,
+        data: &[u8],
+        write_type: btleplug::api::WriteType,
+    ) -> Result<(), Error>;
+
+    /// Sent ahead of anything queued for this device, with response.
+    async fn write_preempt(&self, charac: &Characteristic, data: &[u8]) -> Result<(), Error>;
+}
+
+#[async_trait::async_trait]
+impl GattWriter for Peripheral {
+    async fn write_normal(
+        &self,
+        charac: &Characteristic,
+        data: &[u8],
+        write_type: btleplug::api::WriteType,
+    ) -> Result<(), Error> {
+        self.write(charac, data, write_type).await?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    async fn write_preempt(&self, charac: &Characteristic, data: &[u8]) -> Result<(), Error> {
+        // the Kotlin queue drops pending writes and sends this one next
+        self.write_preemptive(charac, data).await?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn write_preempt(&self, charac: &Characteristic, data: &[u8]) -> Result<(), Error> {
+        // btleplug has no write queue to jump; skipping the op lock is all we can do
+        run_with_timeout(
+            self.write(charac, data, btleplug::api::WriteType::WithResponse),
+            "safety stop write",
+        )
+        .await
+    }
+}
+
+/// A normal write: waits for the device's GATT operation lock.
+async fn locked_write<W: GattWriter + ?Sized>(
+    gatt_op_lock: &Mutex<()>,
+    writer: &W,
+    charac: &Characteristic,
+    data: &[u8],
+    write_type: btleplug::api::WriteType,
+) -> Result<(), Error> {
+    let _gatt_guard = gatt_op_lock.lock().await;
+    writer.write_normal(charac, data, write_type).await
+}
+
+/// A safety stop write. Deliberately does not take the GATT operation lock: a
+/// stop must never wait behind an in-flight write that may take seconds.
+async fn preempt_write<W: GattWriter + ?Sized>(
+    writer: &W,
+    charac: &Characteristic,
+    packet: &[u8],
+) -> Result<(), Error> {
+    writer.write_preempt(charac, packet).await
+}
 
 struct Listener {
     uuid: Uuid,
@@ -102,6 +174,9 @@ pub struct Handler {
 
     write_timeout_in_ms: AtomicU32,
     skip_waiting_for_write_to_complete: AtomicBool,
+
+    /// Per-device stop recipes and their watchdogs.
+    safety: SafetyStops,
 }
 
 impl Handler {
@@ -221,6 +296,7 @@ impl Handler {
             }),
             write_timeout_in_ms: AtomicU32::new(0),
             skip_waiting_for_write_to_complete: AtomicBool::new(false),
+            safety: SafetyStops::new(watchdog_sink()),
         })
     }
 
@@ -489,29 +565,32 @@ impl Handler {
         };
         {
             let mut connections = self.connections.lock().await;
-            connections.entry(address.to_string()).or_insert_with(|| Connection {
-                peripheral: peripheral.clone(),
-                characs: vec![],
-                listen_handle: None,
-                on_disconnect: OnDisconnectHandler::None,
-                notify_listeners: Arc::new(Mutex::new(vec![])),
-                gatt_op_lock: Arc::new(Mutex::new(())),
-                connected_tx: conn_tx.clone(),
-                connected_rx: conn_rx.clone(),
-            });
+            connections
+                .entry(address.to_string())
+                .or_insert_with(|| Connection {
+                    peripheral: peripheral.clone(),
+                    characs: vec![],
+                    listen_handle: None,
+                    on_disconnect: OnDisconnectHandler::None,
+                    notify_listeners: Arc::new(Mutex::new(vec![])),
+                    gatt_op_lock: Arc::new(Mutex::new(())),
+                    connected_tx: conn_tx.clone(),
+                    connected_rx: conn_rx.clone(),
+                });
         }
         if peripheral.is_connected().await? {
             debug!("Device {address} already connected");
-            conn_tx.send(true).expect("failed to send connected update");
+            conn_tx.send_replace(true);
             return Ok(());
         }
         debug!("Connecting to device {address}");
         {
+            // a concurrent disconnect event may already have removed the entry
             let gatt_op_lock = {
                 let connections = self.connections.lock().await;
                 connections
                     .get(address)
-                    .expect("just inserted above")
+                    .ok_or(Error::ConnectionFailed)?
                     .gatt_op_lock
                     .clone()
             };
@@ -521,10 +600,12 @@ impl Handler {
         // wait for the actual connection to be established
         if !*conn_rx.borrow_and_update() {
             info!("waiting for connection event for {address}");
-            conn_rx
-                .changed()
+            wait_changed(&mut conn_rx, "connection event")
                 .await
-                .expect("failed to wait for connection event");
+                .map_err(|e| match e {
+                    WaitError::Timeout => Error::Timeout("connection event".to_string()),
+                    WaitError::Closed => Error::ConnectionFailed,
+                })?;
         }
         if !*conn_rx.borrow() {
             // still not connected
@@ -540,9 +621,8 @@ impl Handler {
     /// This triggers a disconnect and then waits for the actual disconnect event from the adapter.
     /// Other concurrently-connected devices are left untouched.
     /// # Errors
-    /// Returns an error if the device is not connected or if the disconnect fails
-    /// # Panics
-    /// panics if there is an error with handling the internal disconnect event
+    /// Returns an error if the device is not connected, if the disconnect fails, or
+    /// if the disconnect event does not arrive in time
     pub async fn disconnect_device(&self, address: &str) -> Result<(), Error> {
         trace!("disconnect: user-initiated disconnect for {address}");
         info!("disconnect triggered by user for {address}");
@@ -552,10 +632,9 @@ impl Handler {
             (conn.peripheral.clone(), conn.connected_rx.clone())
         };
         if let Ok(true) = peripheral.is_connected().await {
-            assert!(
-                (*conn_rx.borrow_and_update()),
-                "connected_rx is false with {address} being connected, this is a bug"
-            );
+            if !*conn_rx.borrow_and_update() {
+                warn!("connected_rx is false with {address} being connected, waiting for the disconnect event anyway");
+            }
             peripheral.disconnect().await?;
         } else {
             debug!("{address} is not actually connected, cleaning up local state");
@@ -564,10 +643,12 @@ impl Handler {
         }
         // the change will be triggered by handle_event -> handle_disconnect which runs in another
         // task
-        conn_rx
-            .changed()
-            .await
-            .expect("failed to wait for disconnect event");
+        match wait_changed(&mut conn_rx, "disconnect event").await {
+            Ok(()) => {}
+            // the connection entry (and its sender) is gone: it has been torn down
+            Err(WaitError::Closed) => return Ok(()),
+            Err(WaitError::Timeout) => return Err(Error::Timeout("disconnect event".to_string())),
+        }
         if *conn_rx.borrow() {
             // still connected
             return Err(Error::DisconnectFailed);
@@ -603,6 +684,10 @@ impl Handler {
         };
         info!("Handling disconnect for {address} ({peripheral_id})");
         let removed = self.connections.lock().await.remove(&address);
+        // a stop recipe belongs to one connection; this also cancels its watchdog
+        if self.safety.clear(&address) {
+            debug!("cleared safety stop for {address}");
+        }
         if let Some(mut conn) = removed {
             *conn.notify_listeners.lock().await = vec![];
             if let Some(handle) = conn.listen_handle.take() {
@@ -626,8 +711,6 @@ impl Handler {
     ///
     /// # Errors
     /// Returns an error if starting the scan fails
-    /// # Panics
-    /// Panics if there is an error getting devices from the adapter
     pub async fn discover(
         &'static self,
         tx: Option<mpsc::Sender<Vec<BleDevice>>>,
@@ -660,22 +743,28 @@ impl Handler {
         let mut self_devices = self.devices.clone();
         let adapter = adapter.clone();
         state.scan_task = Some(tokio::task::spawn(async move {
+            let mut tx = tx;
             self_devices.lock().await.clear();
             let loops = std::cmp::max(1, timeout / 200);
             let mut devices;
             for _ in 0..loops {
                 sleep(Duration::from_millis(200)).await;
-                let mut discovered = adapter
-                    .peripherals()
-                    .await
-                    .expect("failed to get peripherals");
+                let mut discovered = match adapter.peripherals().await {
+                    Ok(discovered) => discovered,
+                    Err(e) => {
+                        error!("Failed to get peripherals, ending scan: {e}");
+                        break;
+                    }
+                };
                 filter_peripherals(&mut discovered, &filter).await;
                 devices = Self::add_devices(&mut self_devices, discovered).await;
                 if !devices.is_empty() {
-                    if let Some(tx) = &tx {
-                        tx.send(devices.clone())
-                            .await
-                            .expect("failed to send devices");
+                    if let Some(sender) = &tx {
+                        if sender.send(devices.clone()).await.is_err() {
+                            // the listener is gone; keep scanning so connect can find devices
+                            debug!("scan result receiver is gone, no longer reporting devices");
+                            tx = None;
+                        }
                     }
                 }
             }
@@ -694,18 +783,16 @@ impl Handler {
     /// If the devices was already connected, it will stay connected
     /// # Errors
     /// Returns an error if the device is not found, if the connection fails, or if the discovery fails
-    /// # Panics
-    /// Panics if there is an error with the internal disconnect event
     pub async fn discover_services(&self, address: &str) -> Result<Vec<Service>, Error> {
-        let mut already_connected = self.connections.lock().await.contains_key(address);
-        let peripheral = if already_connected {
-            self.connections
-                .lock()
-                .await
-                .get(address)
-                .expect("Connection exists")
-                .peripheral
-                .clone()
+        let connected_peripheral = self
+            .connections
+            .lock()
+            .await
+            .get(address)
+            .map(|c| c.peripheral.clone());
+        let mut already_connected = connected_peripheral.is_some();
+        let peripheral = if let Some(peripheral) = connected_peripheral {
+            peripheral
         } else {
             let peripheral = self
                 .devices
@@ -753,10 +840,9 @@ impl Handler {
                 if *conn_rx.borrow_and_update() {
                     peripheral.disconnect().await?;
                     debug!("waiting for disconnect event");
-                    conn_rx
-                        .changed()
-                        .await
-                        .expect("failed to wait for disconnect event");
+                    if let Err(e) = wait_changed(&mut conn_rx, "disconnect event").await {
+                        warn!("no disconnect event after discovery on {address}: {e:?}");
+                    }
                 }
             }
         }
@@ -832,15 +918,15 @@ impl Handler {
         data: &[u8],
         write_type: models::WriteType,
     ) -> Result<(), Error> {
+        // every attempted send rearms the safety watchdog, whether or not it succeeds
+        self.safety.kick(address);
         let (peripheral, gatt_op_lock, charac) = self.resolve_charac(address, c, service).await?;
-        let _gatt_guard = gatt_op_lock.lock().await;
         trace!(
             "sending {} bytes to characteristic {c} on {address}: {:02x?}",
             data.len(),
             data
         );
-        peripheral.write(&charac, data, write_type.into()).await?;
-        Ok(())
+        locked_write(&gatt_op_lock, &peripheral, &charac, data, write_type.into()).await
     }
 
     /// Backward-compatible wrapper around [`Handler::send_data_to`] that
@@ -972,6 +1058,109 @@ impl Handler {
         self.unsubscribe_from(&address, c).await
     }
 
+    /// Registers (or replaces) the safety stop recipe for the connected device at
+    /// `address`: writing `packet` to `characteristic` in `service` makes the device
+    /// stop. The plugin never interprets the bytes.
+    ///
+    /// With `watchdog_ms`, every attempted send to the device rearms a timer; if no
+    /// send happens within that time the stop packet is written once (preemptively)
+    /// and a warning is logged, and the next send rearms it. The watchdog starts
+    /// armed. The recipe is cleared when the device disconnects.
+    /// # Errors
+    /// Returns an error for an empty packet, a watchdog under 300 ms, a device that
+    /// is not connected, or a characteristic the device does not have
+    pub async fn set_safety_stop(
+        &self,
+        address: &str,
+        service: Uuid,
+        characteristic: Uuid,
+        packet: Vec<u8>,
+        watchdog_ms: Option<u64>,
+    ) -> Result<(), Error> {
+        let recipe = StopRecipe::new(service, characteristic, packet, watchdog_ms)?;
+        // fail now rather than when the stop is needed
+        self.resolve_charac(address, characteristic, Some(service))
+            .await?;
+        info!(
+            "safety stop registered for {address} (watchdog: {:?})",
+            recipe.watchdog
+        );
+        self.safety.set(address, recipe);
+        Ok(())
+    }
+
+    /// Removes the safety stop recipe for `address` and cancels its watchdog.
+    /// Returns whether one was registered.
+    pub fn clear_safety_stop(&self, address: &str) -> bool {
+        self.safety.clear(address)
+    }
+
+    /// Writes the registered stop packet to the device at `address`, preemptively:
+    /// queued writes are dropped and the per-device GATT operation lock is not taken,
+    /// so the stop never waits behind an in-flight write.
+    /// # Errors
+    /// Returns an error if no recipe is registered for `address` or the write fails
+    pub async fn safety_stop_device(&self, address: &str) -> Result<(), Error> {
+        let recipe = self
+            .safety
+            .recipe(address)
+            .ok_or_else(|| Error::NoSafetyStop(address.to_string()))?;
+        self.write_stop_recipe(address, &recipe).await
+    }
+
+    /// Writes the stop packet of every registered device, all at once. Meant for app
+    /// lifecycle hooks (`tauri_plugin_blec::get_handler()?.safety_stop_all()`); it
+    /// never blocks the thread, but the caller should spawn it rather than wait on it
+    /// from a thread that must stay responsive.
+    ///
+    /// Returns the outcome per device. No registered device is not an error.
+    /// # Errors
+    /// Returns an error if every attempted device failed
+    pub async fn safety_stop_all(&self) -> Result<Vec<SafetyStopOutcome>, Error> {
+        let targets = self.safety.all();
+        let outcomes =
+            futures::future::join_all(targets.into_iter().map(|(address, recipe)| async move {
+                let result = self.write_stop_recipe(&address, &recipe).await;
+                SafetyStopOutcome::from_result(address, result)
+            }))
+            .await;
+        safety::summarize(outcomes)
+    }
+
+    /// Safety stop for one address, or for every registered device when `address`
+    /// is `None`. See [`Handler::safety_stop_device`] and [`Handler::safety_stop_all`].
+    /// # Errors
+    /// Returns an error if every attempted device failed (or the one given has no recipe)
+    pub async fn safety_stop(
+        &self,
+        address: Option<&str>,
+    ) -> Result<Vec<SafetyStopOutcome>, Error> {
+        match address {
+            Some(address) => {
+                let result = self.safety_stop_device(address).await;
+                safety::summarize(vec![SafetyStopOutcome::from_result(
+                    address.to_string(),
+                    result,
+                )])
+            }
+            None => self.safety_stop_all().await,
+        }
+    }
+
+    async fn write_stop_recipe(&self, address: &str, recipe: &StopRecipe) -> Result<(), Error> {
+        // only the connections map is locked, and only to clone the handles out
+        let (peripheral, _gatt_op_lock, charac) = self
+            .resolve_charac(address, recipe.characteristic, Some(recipe.service))
+            .await?;
+        debug!("writing safety stop to {address}");
+        let result = preempt_write(&peripheral, &charac, &recipe.packet).await;
+        match &result {
+            Ok(()) => info!("safety stop written to {address}"),
+            Err(e) => warn!("safety stop for {address} failed: {e}"),
+        }
+        result
+    }
+
     pub(crate) async fn handle_event(&self, event: CentralEvent) -> Result<(), Error> {
         debug!("handling event: {event:?}");
         match event {
@@ -1049,7 +1238,7 @@ impl Handler {
         };
         trace!("handle_connect: DeviceConnected event for {peripheral_id} ({address})");
         debug!("connection to {address} established");
-        tx.send(true).expect("failed to send connected update");
+        tx.send_replace(true);
         self.refresh_aggregate_connected().await;
     }
 
@@ -1097,6 +1286,36 @@ impl Handler {
             }
         }
     }
+}
+
+#[derive(Debug)]
+enum WaitError {
+    Timeout,
+    Closed,
+}
+
+/// Waits for the next change of a connection-state watch, bounded by
+/// [`CONNECTION_EVENT_TIMEOUT`] so a lost adapter event cannot hang the caller.
+async fn wait_changed(rx: &mut watch::Receiver<bool>, what: &str) -> Result<(), WaitError> {
+    match tokio::time::timeout(CONNECTION_EVENT_TIMEOUT, rx.changed()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(WaitError::Closed),
+        Err(_) => {
+            warn!("timed out waiting for {what}");
+            Err(WaitError::Timeout)
+        }
+    }
+}
+
+/// The watchdog's way to write a stop packet: through the global handler, so it
+/// always uses the connection that is current when it fires.
+fn watchdog_sink() -> StopSink {
+    Arc::new(|address: String, recipe: Arc<StopRecipe>| {
+        Box::pin(async move {
+            let handler = crate::get_handler()?;
+            handler.write_stop_recipe(&address, &recipe).await
+        })
+    })
 }
 
 async fn run_with_timeout<T: Send + Sync + 'static>(
@@ -1230,6 +1449,111 @@ fn resolve_default_address<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use btleplug::api::CharPropFlags;
+    use std::collections::BTreeSet;
+
+    /// Records which kind of write was made; normal writes take as long as `delay`.
+    struct FakeWriter {
+        delay: Duration,
+        normal: std::sync::Mutex<Vec<Vec<u8>>>,
+        preempt: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GattWriter for FakeWriter {
+        async fn write_normal(
+            &self,
+            _charac: &Characteristic,
+            data: &[u8],
+            _write_type: btleplug::api::WriteType,
+        ) -> Result<(), Error> {
+            tokio::time::sleep(self.delay).await;
+            self.normal.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+
+        async fn write_preempt(&self, _charac: &Characteristic, data: &[u8]) -> Result<(), Error> {
+            self.preempt.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+    }
+
+    fn charac() -> Characteristic {
+        Characteristic {
+            uuid: Uuid::from_u128(2),
+            service_uuid: Uuid::from_u128(1),
+            properties: CharPropFlags::WRITE,
+            descriptors: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn preempt_write_skips_the_gatt_op_lock() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = Arc::new(FakeWriter {
+                    delay: Duration::from_secs(5),
+                    normal: Default::default(),
+                    preempt: Default::default(),
+                });
+                let lock = Arc::new(Mutex::new(()));
+                let c = charac();
+
+                // a normal write holds the lock for 5 s
+                let in_flight = {
+                    let (writer, lock, c) = (writer.clone(), lock.clone(), c.clone());
+                    tokio::spawn(async move {
+                        locked_write(
+                            &lock,
+                            writer.as_ref(),
+                            &c,
+                            &[1],
+                            btleplug::api::WriteType::WithoutResponse,
+                        )
+                        .await
+                    })
+                };
+                tokio::task::yield_now().await;
+                assert!(
+                    lock.try_lock().is_err(),
+                    "the in-flight write holds the lock"
+                );
+
+                // a second normal write waits behind it...
+                let queued = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    locked_write(
+                        &lock,
+                        writer.as_ref(),
+                        &c,
+                        &[2],
+                        btleplug::api::WriteType::WithoutResponse,
+                    ),
+                )
+                .await;
+                assert!(queued.is_err(), "a normal write must wait for the lock");
+
+                // ...while the stop goes straight through
+                let start = tokio::time::Instant::now();
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    preempt_write(writer.as_ref(), &c, &[0xB0, 0]),
+                )
+                .await
+                .expect("the stop must not wait for the lock")
+                .unwrap();
+                assert_eq!(start.elapsed(), Duration::ZERO);
+                assert_eq!(*writer.preempt.lock().unwrap(), vec![vec![0xB0, 0]]);
+                assert!(writer.normal.lock().unwrap().is_empty());
+
+                in_flight.await.unwrap().unwrap();
+                assert_eq!(*writer.normal.lock().unwrap(), vec![vec![1]]);
+            });
+    }
 
     #[test]
     fn resolve_default_address_errors_when_nothing_connected() {

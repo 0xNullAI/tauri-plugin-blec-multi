@@ -43,6 +43,18 @@ pub enum Error {
     #[error("Timeout during execution of {0}")]
     Timeout(String),
 
+    #[error("Invalid safety stop: {0}")]
+    InvalidSafetyStop(String),
+
+    #[error("No safety stop registered for {0}")]
+    NoSafetyStop(String),
+
+    #[error("Safety stop failed for every device: {0}")]
+    SafetyStopFailed(String),
+
+    #[error("Data is not valid UTF-8: {0}")]
+    InvalidUtf8(#[from] std::string::FromUtf8Error),
+
     #[error("Failed to join Task: {0}")]
     JoinError(#[from] tokio::task::JoinError),
 

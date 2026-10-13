@@ -20,6 +20,9 @@ Default permissions for the plugin
 - `allow-list-services`
 - `allow-check-permissions`
 - `allow-get-adapter-state`
+- `allow-set-safety-stop`
+- `allow-clear-safety-stop`
+- `allow-safety-stop`
 
 ## Permission Table
 
@@ -52,6 +55,32 @@ Enables the check_permissions command without any pre-configured scope.
 <td>
 
 Denies the check_permissions command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`blec:allow-clear-safety-stop`
+
+</td>
+<td>
+
+Enables the clear_safety_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`blec:deny-clear-safety-stop`
+
+</td>
+<td>
+
+Denies the clear_safety_stop command without any pre-configured scope.
 
 </td>
 </tr>
@@ -241,6 +270,32 @@ Denies the recv_string command without any pre-configured scope.
 <tr>
 <td>
 
+`blec:allow-safety-stop`
+
+</td>
+<td>
+
+Enables the safety_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`blec:deny-safety-stop`
+
+</td>
+<td>
+
+Denies the safety_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `blec:allow-scan`
 
 </td>
@@ -338,6 +393,32 @@ Enables the send_string command without any pre-configured scope.
 <td>
 
 Denies the send_string command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`blec:allow-set-safety-stop`
+
+</td>
+<td>
+
+Enables the set_safety_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`blec:deny-set-safety-stop`
+
+</td>
+<td>
+
+Denies the set_safety_stop command without any pre-configured scope.
 
 </td>
 </tr>
